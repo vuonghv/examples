@@ -51,6 +51,10 @@ func (l *orderList) Remove(clordID string) (order *Order) {
 	return
 }
 
+func (l *orderList) Orders() []*Order {
+	return l.orders
+}
+
 func bids() (b orderList) {
 	b.sortBy = func(i, j *Order) bool {
 		switch i.Price.Cmp(j.Price) {

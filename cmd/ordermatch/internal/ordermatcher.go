@@ -82,3 +82,8 @@ func (m *OrderMatcher) Match(symbol string) []Order {
 
 	return market.Match()
 }
+
+func (m *OrderMatcher) GetMarket(symbol string) (*Market, bool) {
+	market, ok := m.markets[symbol]
+	return market, ok
+}

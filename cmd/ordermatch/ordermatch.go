@@ -32,6 +32,7 @@ import (
 	"github.com/quickfixgo/field"
 	"github.com/quickfixgo/fix42/executionreport"
 	"github.com/quickfixgo/fix42/marketdatarequest"
+	"github.com/quickfixgo/fix42/marketdatasnapshotfullrefresh"
 	"github.com/quickfixgo/fix42/newordersingle"
 	"github.com/quickfixgo/fix42/ordercancelrequest"
 	"github.com/spf13/cobra"
@@ -175,8 +176,118 @@ func (a *Application) onOrderCancelRequest(msg ordercancelrequest.OrderCancelReq
 }
 
 func (a *Application) onMarketDataRequest(msg marketdatarequest.MarketDataRequest, _ quickfix.SessionID) (err quickfix.MessageRejectError) {
-	fmt.Printf("%+v\n", msg)
-	return
+	// Get MDReqID for correlation
+	mdReqID, err := msg.GetMDReqID()
+	if err != nil {
+		return err
+	}
+
+	// Get sender and target for response routing
+	senderCompID, err := msg.Header.GetSenderCompID()
+	if err != nil {
+		return err
+	}
+
+	targetCompID, err := msg.Header.GetTargetCompID()
+	if err != nil {
+		return err
+	}
+
+	// Get requested symbols
+	noRelatedSym, err := msg.GetNoRelatedSym()
+	if err != nil {
+		return err
+	}
+
+	// Get requested entry types (BID, OFFER, etc.)
+	noMDEntryTypes, err := msg.GetNoMDEntryTypes()
+	if err != nil {
+		return err
+	}
+
+	// Build a map of requested entry types for easy lookup
+	requestedTypes := make(map[enum.MDEntryType]bool)
+	for i := 0; i < noMDEntryTypes.Len(); i++ {
+		entryType, getErr := noMDEntryTypes.Get(i).GetMDEntryType()
+		if getErr == nil {
+			requestedTypes[entryType] = true
+		}
+	}
+
+	// Process each requested symbol
+	for i := 0; i < noRelatedSym.Len(); i++ {
+		symbol, getErr := noRelatedSym.Get(i).GetSymbol()
+		if getErr != nil {
+			continue
+		}
+
+		// Send market data snapshot for this symbol
+		a.sendMarketDataSnapshot(mdReqID, symbol, requestedTypes, senderCompID, targetCompID)
+	}
+
+	return nil
+}
+
+func (a *Application) sendMarketDataSnapshot(mdReqID, symbol string, requestedTypes map[enum.MDEntryType]bool, senderCompID, targetCompID string) {
+	// Get the market for this symbol
+	market, exists := a.OrderMatcher.GetMarket(symbol)
+	if !exists {
+		// Symbol not found, send empty snapshot
+		snapshot := marketdatasnapshotfullrefresh.New(field.NewSymbol(symbol))
+		snapshot.SetMDReqID(mdReqID)
+
+		// Set header routing (swap sender and target for response)
+		snapshot.Header.SetSenderCompID(targetCompID)
+		snapshot.Header.SetTargetCompID(senderCompID)
+
+		quickfix.Send(snapshot)
+		return
+	}
+
+	// Create market data snapshot
+	snapshot := marketdatasnapshotfullrefresh.New(field.NewSymbol(symbol))
+	snapshot.SetMDReqID(mdReqID)
+
+	// Set header routing (swap sender and target for response)
+	snapshot.Header.SetSenderCompID(targetCompID)
+	snapshot.Header.SetTargetCompID(senderCompID)
+
+	// Add market data entries
+	entries := marketdatasnapshotfullrefresh.NewNoMDEntriesRepeatingGroup()
+
+	// Add bids if requested
+	if requestedTypes[enum.MDEntryType_BID] || len(requestedTypes) == 0 {
+		for _, bid := range market.Bids.Orders() {
+			if !bid.IsClosed() {
+				entry := entries.Add()
+				entry.SetMDEntryType(enum.MDEntryType_BID)
+				entry.SetMDEntryPx(bid.Price, 2)
+				entry.SetMDEntrySize(bid.OpenQuantity(), 2)
+				entry.SetOrderID(bid.ClOrdID)
+			}
+		}
+	}
+
+	// Add offers if requested
+	if requestedTypes[enum.MDEntryType_OFFER] || len(requestedTypes) == 0 {
+		for _, offer := range market.Offers.Orders() {
+			if !offer.IsClosed() {
+				entry := entries.Add()
+				entry.SetMDEntryType(enum.MDEntryType_OFFER)
+				entry.SetMDEntryPx(offer.Price, 2)
+				entry.SetMDEntrySize(offer.OpenQuantity(), 2)
+				entry.SetOrderID(offer.ClOrdID)
+			}
+		}
+	}
+
+	snapshot.SetNoMDEntries(entries)
+
+	// Send the snapshot
+	sendErr := quickfix.Send(snapshot)
+	if sendErr != nil {
+		fmt.Printf("Error sending market data snapshot: %v\n", sendErr)
+	}
 }
 
 func (a *Application) acceptOrder(order internal.Order) {
